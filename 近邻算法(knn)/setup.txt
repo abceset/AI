@@ -1,0 +1,4 @@
+D:\Engenharia Elétrica\2011.1\Estruturas\KNN\Dados\Liver1.txt
+D:\Engenharia Elétrica\2011.1\Estruturas\KNN\Dados\Liver2.txt
+21
+2

@@ -1,0 +1,916 @@
+#include <assert.h>
+#include <malloc.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "himqtt_rvm.h"
+
+/******************************************************************************
+* himqttrvm specific macro definitions
+******************************************************************************/
+
+#define HIMQTTRVM_VERSION_MAJOR 0
+#define HIMQTTRVM_VERSION_MINOR 2
+#define HIMQTTRVM_VERSION_PATCH 0
+
+/* Defining private functions as static helps keeping library size low. */
+#define HIMQTTRVM_STATIC static
+
+/* This helps to identify uninitialized structures. */
+#define HIMQTTRVM_STRUCT_MAGIC 0xACDC
+
+/* Special identifier for bias */
+#define HIMQTTRVM_BIAS_MAGIC SIZE_MAX
+
+/* Limiting the matrix dimension to the maximum size allowable by CBLAS/LAPACKE interface. */
+#define HIMQTTRVM_MAT_DIM_MAX INT32_MAX
+
+/******************************************************************************
+* Implementing required CBLAS/LAPACKE functions over BLAS/LAPACK so we don't
+* have to deal with their non-standard packagings.
+* (Taken from Netlib's CBLAS/LAPACKE 3.8)
+******************************************************************************/
+
+/* CBLAS */
+extern double ddot_(const int* N, const double* X, const int* incX, const double* Y, const int* incY);
+extern void dscal_(const int* N, const double* alpha, double* X, const int* incX);
+extern void dgemv_(const char* TransA, const int* M, const int* N, const double* alpha, const double* A, const int* lda, const double* X, const int* incX, const double* beta, double* Y, const int* incY);
+extern void dgemm_(const char* TransA, const char* TransB, const int* M, const int* N, const int* K, const double* alpha, const double* A, const int* lda, const double* B, const int* ldb, const double* beta, double* C, const int* ldc);
+
+typedef enum { CblasRowMajor = 101,
+    CblasColMajor = 102 } CBLAS_LAYOUT;
+typedef enum { CblasNoTrans = 111,
+    CblasTrans = 112,
+    CblasConjTrans = 113 } CBLAS_TRANSPOSE;
+
+HIMQTTRVM_STATIC char translate_transpose(CBLAS_TRANSPOSE transpose)
+{
+    switch (transpose) {
+    case CblasNoTrans:
+        return 'N';
+    case CblasTrans:
+        return 'T';
+    case CblasConjTrans:
+        return 'C';
+    default:
+        /* unknown value passed in */
+        assert(false);
+        abort();
+    }
+}
+
+HIMQTTRVM_STATIC double cblas_ddot(const int N, const double* X, const int incX, const double* Y, const int incY)
+{
+    return ddot_(&N, X, &incX, Y, &incY);
+}
+
+HIMQTTRVM_STATIC void cblas_dscal(const int N, const double alpha, double* X, const int incX)
+{
+    dscal_(&N, &alpha, X, &incX);
+}
+
+HIMQTTRVM_STATIC void cblas_dgemv(CBLAS_LAYOUT layout, CBLAS_TRANSPOSE TransA, const int M, const int N, const double alpha, const double* A, const int lda, const double* X, const int incX, const double beta, double* Y, const int incY)
+{
+    char _TransA = translate_transpose(TransA);
+    dgemv_(&_TransA, &M, &N, &alpha, A, &lda, X, &incX, &beta, Y, &incY);
+}
+
+HIMQTTRVM_STATIC void cblas_dgemm(CBLAS_LAYOUT layout, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, const int M, const int N, const int K, const double alpha, const double* A, const int lda, const double* B, const int ldb, const double beta, double* C, const int ldc)
+{
+    char _TransA = translate_transpose(TransA);
+    char _TransB = translate_transpose(TransB);
+    dgemm_(&_TransA, &_TransB, &M, &N, &K, &alpha, A, &lda, B, &ldb, &beta, C, &ldc);
+}
+
+/* LAPACKE */
+extern void dpotrf_(const char* uplo, const int* n, double* a, const int* lda, int* info);
+extern void dpotrs_(const char* uplo, const int* n, const int* nrhs, const double* a, const int* lda, double* b, const int* ldb, int* info);
+
+#define lapack_int int
+#define LAPACK_ROW_MAJOR 101
+#define LAPACK_COL_MAJOR 102
+
+HIMQTTRVM_STATIC lapack_int LAPACKE_dpotrf(int matrix_layout, char uplo, lapack_int n, double* a, lapack_int lda)
+{
+    int info = 0;
+    dpotrf_(&uplo, &n, a, &lda, &info);
+    return info;
+}
+
+HIMQTTRVM_STATIC lapack_int LAPACKE_dpotrs(int matrix_layout, char uplo, lapack_int n, lapack_int nrhs, const double* a, lapack_int lda, double* b, lapack_int ldb)
+{
+    int info = 0;
+    dpotrs_(&uplo, &n, &nrhs, a, &lda, b, &ldb, &info);
+    return info;
+}
+
+/******************************************************************************
+* Utility functions
+******************************************************************************/
+
+HIMQTTRVM_STATIC void* nextend(void* mem_addr, size_t count, size_t size, bool keep_content)
+{
+    if ((0 == count) || (0 == size) || (count > SIZE_MAX / size)) {
+        assert(false);
+        abort();
+    }
+
+    void* addr = NULL;
+
+    if ((true == keep_content) && (NULL != mem_addr)) {
+        addr = realloc(mem_addr, count * size);
+    } else {
+        if (NULL != mem_addr) {
+            free(mem_addr);
+        }
+
+        addr = malloc(count * size);
+    }
+
+    if (NULL == addr) {
+        assert(false);
+        abort();
+    }
+
+    return addr;
+}
+
+HIMQTTRVM_STATIC void* nmalloc(size_t count, size_t size)
+{
+    return nextend(NULL, count, size, false);
+}
+
+HIMQTTRVM_STATIC void nfree(void* mem_addr)
+{
+    if (NULL == mem_addr) {
+        assert(false);
+        abort();
+    }
+
+    free(mem_addr);
+}
+
+HIMQTTRVM_STATIC bool is_finite(double* numbers, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (0 == isfinite(numbers[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/******************************************************************************
+* Training cache related data types and functions
+******************************************************************************/
+
+struct himqttrvm_cache {
+    size_t struct_initialized;
+
+    double beta;
+
+    /* data prefixed with m_ denote 2D matrices */
+    double* m_alpha_diag;
+    double* m_phi;
+    double* m_phiTphi;
+    double* m_sigma;
+
+    /* data prefixed with v_ denote 1D vectors */
+    double* v_alpha;
+    double* v_alpha_old;
+    double* v_error;
+    double* v_gamma;
+    double* v_mu;
+    double* v_phiTy;
+    double* v_y;
+
+    size_t* v_index;
+
+    size_t m; /* total sample count */
+    size_t n; /* current basis function count */
+    size_t n_reserved; /* reserved basis function space count */
+    size_t n_train_current; /* number of basis functions used at the beginning of current training session */
+
+    bool bias_used; /* keeping track of bias presence among basis functions during training sessions */
+};
+
+HIMQTTRVM_API int himqttrvm_create_cache(himqttrvm_cache** cache, double* y, size_t count)
+{
+    if (NULL == cache) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if ((NULL == y) || (false == is_finite(y, count))) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if ((2 > count) || (HIMQTTRVM_MAT_DIM_MAX - 1 < count) || (SIZE_MAX / sizeof(double) < count)) {
+        /* Reserved for bias ---------------- ^ */
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    (*cache) = nmalloc(1, sizeof(himqttrvm_cache));
+
+    (*cache)->beta = 0.0;
+
+    (*cache)->m_alpha_diag = NULL;
+    (*cache)->m_phi = NULL;
+    (*cache)->m_phiTphi = NULL;
+    (*cache)->m_sigma = NULL;
+
+    (*cache)->v_alpha = NULL;
+    (*cache)->v_alpha_old = NULL;
+    (*cache)->v_error = nmalloc(count, sizeof(double));
+    (*cache)->v_gamma = NULL;
+    (*cache)->v_mu = NULL;
+    (*cache)->v_phiTy = NULL;
+    (*cache)->v_y = nmalloc(count, sizeof(double));
+    memcpy((*cache)->v_y, y, count * sizeof(double));
+
+    (*cache)->v_index = NULL;
+
+    (*cache)->m = count;
+    (*cache)->n = 0;
+    (*cache)->n_reserved = 0;
+    (*cache)->n_train_current = 0;
+    (*cache)->bias_used = false;
+
+    (*cache)->struct_initialized = HIMQTTRVM_STRUCT_MAGIC;
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_API int himqttrvm_destroy_cache(himqttrvm_cache* cache)
+{
+    if ((NULL == cache) || (HIMQTTRVM_STRUCT_MAGIC != cache->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    /* no need to free up unallocated memory space */
+    if (0 != cache->n_reserved) {
+        nfree(cache->m_alpha_diag);
+        nfree(cache->m_phi);
+        nfree(cache->m_phiTphi);
+        nfree(cache->m_sigma);
+
+        nfree(cache->v_alpha);
+        nfree(cache->v_alpha_old);
+        nfree(cache->v_gamma);
+        nfree(cache->v_mu);
+        nfree(cache->v_phiTy);
+
+        nfree(cache->v_index);
+    }
+
+    nfree(cache->v_error);
+    nfree(cache->v_y);
+
+    nfree(cache);
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+/******************************************************************************
+* Training parameter related data types and functions
+******************************************************************************/
+
+struct himqttrvm_param {
+    size_t struct_initialized;
+
+    double alpha_init;
+    double alpha_max;
+    double alpha_tol;
+    double beta_init;
+
+    double pcnt_min; /* minimum percentage of basis functions to keep during every training session */
+    size_t iter_max;
+};
+
+HIMQTTRVM_API int himqttrvm_create_param(himqttrvm_param** param, double alpha_init, double alpha_max, double alpha_tol, double beta_init, double basis_percent_min, size_t iter_max)
+{
+    if (NULL == param) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if ((false == is_finite(&alpha_init, 1)) || (0.0 >= alpha_init)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if ((false == is_finite(&alpha_max, 1)) || (0.0 >= alpha_max) || (alpha_init >= alpha_max)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    if ((false == is_finite(&alpha_tol, 1)) || (0.0 >= alpha_tol)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P4;
+    }
+
+    if ((false == is_finite(&beta_init, 1)) || (0.0 >= beta_init)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P5;
+    }
+
+    if ((false == is_finite(&basis_percent_min, 1)) || (0.0 > basis_percent_min) || (100.0 < basis_percent_min)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P6;
+    }
+
+    if (1 > iter_max) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P7;
+    }
+
+    (*param) = nmalloc(1, sizeof(himqttrvm_param));
+
+    (*param)->alpha_init = alpha_init;
+    (*param)->alpha_max = alpha_max;
+    (*param)->alpha_tol = alpha_tol;
+    (*param)->beta_init = beta_init;
+
+    (*param)->pcnt_min = basis_percent_min;
+    (*param)->iter_max = iter_max;
+
+    (*param)->struct_initialized = HIMQTTRVM_STRUCT_MAGIC;
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_API int himqttrvm_destroy_param(himqttrvm_param* param)
+{
+    if ((NULL == param) || (HIMQTTRVM_STRUCT_MAGIC != param->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    nfree(param);
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+/******************************************************************************
+* Training related functions
+******************************************************************************/
+
+HIMQTTRVM_STATIC void resize_cache(himqttrvm_cache* c)
+{
+    /* grow reserved memory space for basis functions by 1.5x */
+    if (c->n > 2 * (SIZE_MAX / 3)) {
+        /* avoid unsigned integer wrapping */
+        assert(false);
+        abort();
+    }
+    c->n_reserved = (3 * c->n) / 2;
+
+    /* reallocate space */
+    if (c->m > SIZE_MAX / c->n_reserved) {
+        /* avoid unsigned integer wrapping */
+        assert(false);
+        abort();
+    }
+    size_t mat_count = c->n_reserved * c->n_reserved;
+    size_t vec_count = c->n_reserved;
+    size_t phi_count = c->m * c->n_reserved;
+
+    c->m_alpha_diag = nextend(c->m_alpha_diag, mat_count, sizeof(double), false);
+    c->m_phi = nextend(c->m_phi, phi_count, sizeof(double), true); /* keep content */
+    c->m_phiTphi = nextend(c->m_phiTphi, mat_count, sizeof(double), false);
+    c->m_sigma = nextend(c->m_sigma, mat_count, sizeof(double), false);
+
+    c->v_alpha = nextend(c->v_alpha, vec_count, sizeof(double), false);
+    c->v_alpha_old = nextend(c->v_alpha_old, vec_count, sizeof(double), false);
+    c->v_gamma = nextend(c->v_gamma, vec_count, sizeof(double), false);
+    c->v_mu = nextend(c->v_mu, vec_count, sizeof(double), false);
+    c->v_phiTy = nextend(c->v_phiTy, vec_count, sizeof(double), false);
+
+    c->v_index = nextend(c->v_index, vec_count, sizeof(size_t), true); /* keep content */
+}
+
+HIMQTTRVM_STATIC void init_alpha_beta(himqttrvm_cache* c, himqttrvm_param* p)
+{
+    for (size_t i = 0; i < c->n; i++) {
+        c->v_alpha[i] = p->alpha_init;
+        c->v_alpha_old[i] = p->alpha_init;
+    }
+
+    c->beta = p->beta_init;
+}
+
+HIMQTTRVM_STATIC void add_bias(himqttrvm_cache* c)
+{
+    size_t index_offset = c->m * (c->n - 1);
+
+    /* append a column of 1.0s to the design matrix (phi) */
+    for (size_t i = 0; i < c->m; i++) {
+        c->m_phi[index_offset + i] = 1.0;
+    }
+
+    /* set last index to bias magic number */
+    c->v_index[c->n - 1] = HIMQTTRVM_BIAS_MAGIC;
+}
+
+HIMQTTRVM_STATIC void update_cache(himqttrvm_cache* c, himqttrvm_param* p, double* phi, size_t* index, size_t count)
+{
+    size_t n_old = c->n;
+
+    /* num basis total + (0: bias was useful in previous iteration, 1: need to add bias again) */
+    c->n = c->n + count + (c->bias_used ? 0 : 1);
+    c->n_train_current = c->n;
+
+    /* make more room if necessary */
+    if (c->n > c->n_reserved) {
+        resize_cache(c);
+    }
+
+    /* (re)initialize alpha and beta */
+    init_alpha_beta(c, p);
+
+    /* add new indices and basis functions */
+    memcpy(&c->m_phi[c->m * n_old], phi, c->m * count * sizeof(double));
+    memcpy(&c->v_index[n_old], index, count * sizeof(size_t));
+
+    /* add bias if necessary */
+    if (false == c->bias_used) {
+        add_bias(c);
+    }
+
+    /* precalculate phi.T*phi and phi.T*y matrices */
+    cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans, c->n, c->n, c->m, 1.0, c->m_phi, c->m, c->m_phi, c->m, 0.0, c->m_phiTphi, c->n);
+    cblas_dgemv(CblasColMajor, CblasTrans, c->m, c->n, 1.0, c->m_phi, c->m, c->v_y, 1, 0.0, c->v_phiTy, 1);
+}
+
+HIMQTTRVM_STATIC bool alpha_tol_met(himqttrvm_cache* c, himqttrvm_param* p)
+{
+    double diff_max = 0.0;
+
+    for (size_t i = 0; i < c->n; i++) {
+        double diff = c->v_alpha[i] - c->v_alpha_old[i];
+        diff = diff > 0.0 ? diff : -diff; /* abs */
+        diff_max = diff_max > diff ? diff_max : diff; /* max */
+    }
+
+    bool result = p->alpha_tol >= diff_max;
+
+    return result;
+}
+
+HIMQTTRVM_STATIC bool pcnt_min_met(himqttrvm_cache* c, himqttrvm_param* p)
+{
+    double pcnt = (c->n * 100.0) / c->n_train_current;
+
+    bool result = pcnt <= p->pcnt_min;
+
+    return result;
+}
+
+HIMQTTRVM_STATIC bool convergence_conditions_met(himqttrvm_cache* c, himqttrvm_param* p, size_t iteration)
+{
+    bool condition1 = iteration > 1;
+
+    bool condition2 = alpha_tol_met(c, p);
+
+    bool condition3 = pcnt_min_met(c, p);
+
+    bool result = (condition1 && condition2) || condition3;
+
+    return result;
+}
+
+HIMQTTRVM_STATIC void calc_sigma(himqttrvm_cache* c)
+{
+    memcpy(c->m_sigma, c->m_phiTphi, c->n * c->n * sizeof(double));
+    cblas_dscal(c->n * c->n, c->beta, c->m_sigma, 1);
+
+    /* add v_alpha to m_sigma diagonal elements */
+    for (size_t i = 0; i < c->n; i++) {
+        c->m_sigma[i * c->n + i] += c->v_alpha[i];
+    }
+}
+
+HIMQTTRVM_STATIC int calc_factor(himqttrvm_cache* c)
+{
+    int status = LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'U', c->n, c->m_sigma, c->n);
+    if (0 != status) {
+        assert(false);
+        return HIMQTTRVM_LAPACK_ERROR;
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC int calc_mu(himqttrvm_cache* c)
+{
+    memcpy(c->v_mu, c->v_phiTy, c->n * sizeof(double));
+    cblas_dscal(c->n, c->beta, c->v_mu, 1);
+
+    int status = LAPACKE_dpotrs(LAPACK_COL_MAJOR, 'U', c->n, 1, c->m_sigma, c->n, c->v_mu, c->n);
+    if (0 != status) {
+        assert(false);
+        return HIMQTTRVM_LAPACK_ERROR;
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC int calc_gamma(himqttrvm_cache* c)
+{
+    /* set diagonal elements to v_alpha */
+    memset(c->m_alpha_diag, 0, c->n * c->n * sizeof(double));
+    for (size_t i = 0; i < c->n; i++) {
+        c->m_alpha_diag[i * c->n + i] = c->v_alpha[i];
+    }
+
+    int status = LAPACKE_dpotrs(LAPACK_COL_MAJOR, 'U', c->n, c->n, c->m_sigma, c->n, c->m_alpha_diag, c->n);
+    if (0 != status) {
+        assert(false);
+        return HIMQTTRVM_LAPACK_ERROR;
+    }
+
+    /* extract the diagonal elements and calc final gamma */
+    for (size_t i = 0; i < c->n; i++) {
+        c->v_gamma[i] = 1.0 - c->m_alpha_diag[i * c->n + i];
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC void calc_alpha(himqttrvm_cache* c)
+{
+    for (size_t i = 0; i < c->n; i++) {
+        c->v_alpha[i] = c->v_gamma[i] / (c->v_mu[i] * c->v_mu[i]);
+    }
+}
+
+HIMQTTRVM_STATIC void calc_beta(himqttrvm_cache* c)
+{
+    memcpy(c->v_error, c->v_y, c->m * sizeof(double));
+    cblas_dgemv(CblasColMajor, CblasNoTrans, c->m, c->n, -1.0, c->m_phi, c->m, c->v_mu, 1, 1.0, c->v_error, 1);
+
+    /* calc sum v_gamma */
+    double sum_gamma = 0.0;
+    for (size_t i = 0; i < c->n; i++) {
+        sum_gamma += c->v_gamma[i];
+    }
+
+    c->beta = (c->m - sum_gamma) / cblas_ddot(c->m, c->v_error, 1, c->v_error, 1);
+}
+
+HIMQTTRVM_STATIC void filter_basis_funcs(himqttrvm_cache* c, himqttrvm_param* p)
+{
+    size_t index_tail = c->n - 1;
+
+    for (size_t i = 0; i < index_tail; i++) {
+        if (c->v_alpha[i] > p->alpha_max) {
+            for (size_t j = index_tail; j > i; j--) {
+                index_tail--;
+
+                if (c->v_alpha[j] < p->alpha_max) {
+                    memcpy(&c->m_phi[i * c->m], &c->m_phi[j * c->m], c->m * sizeof(double));
+
+                    memcpy(&c->m_phiTphi[i * c->n], &c->m_phiTphi[j * c->n], c->n * sizeof(double));
+                    for (size_t k = 0; k < j; k++) {
+                        c->m_phiTphi[k * c->n + i] = c->m_phiTphi[k * c->n + j];
+                    }
+
+                    c->v_alpha[i] = c->v_alpha[j];
+                    c->v_alpha_old[i] = c->v_alpha_old[j];
+                    c->v_mu[i] = c->v_mu[j];
+                    c->v_phiTy[i] = c->v_phiTy[j];
+
+                    c->v_index[i] = c->v_index[j];
+
+                    break;
+                }
+            }
+        }
+    }
+
+    /* compact phiTphi if there is anything removed */
+    if (index_tail != (c->n - 1)) {
+        for (size_t i = 0; i < index_tail; i++) {
+            memmove(&c->m_phiTphi[(i + 1) * (index_tail + 1)], &c->m_phiTphi[(i + 1) * c->n], (index_tail + 1) * sizeof(double));
+        }
+    }
+
+    c->n = index_tail + 1;
+}
+
+HIMQTTRVM_STATIC int check_numbers(himqttrvm_cache* c)
+{
+    if (false == is_finite(c->v_mu, c->n)) {
+        assert(false);
+        return HIMQTTRVM_MATH_ERROR;
+    }
+
+    if (false == is_finite(c->v_alpha, c->n)) {
+        assert(false);
+        return HIMQTTRVM_MATH_ERROR;
+    }
+
+    if (false == is_finite(&c->beta, 1)) {
+        assert(false);
+        return HIMQTTRVM_MATH_ERROR;
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC int main_training_loop(himqttrvm_cache* c, himqttrvm_param* p)
+{
+    for (size_t i = 0; i < p->iter_max; i++) {
+        int status = HIMQTTRVM_SUCCESS;
+
+        /* check for convergence */
+        if (true == convergence_conditions_met(c, p, i)) {
+            break;
+        }
+
+        filter_basis_funcs(c, p);
+
+        memcpy(c->v_alpha_old, c->v_alpha, c->n * sizeof(double));
+
+        calc_sigma(c);
+
+        status = calc_factor(c);
+        if (HIMQTTRVM_SUCCESS != status) {
+            return status;
+        }
+
+        status = calc_mu(c);
+        if (HIMQTTRVM_SUCCESS != status) {
+            return status;
+        }
+
+        status = calc_gamma(c);
+        if (HIMQTTRVM_SUCCESS != status) {
+            return status;
+        }
+
+        calc_alpha(c);
+
+        calc_beta(c);
+
+        status = check_numbers(c);
+        if (HIMQTTRVM_SUCCESS != status) {
+            return status;
+        }
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC bool contains_bias(size_t* numbers, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (HIMQTTRVM_BIAS_MAGIC == numbers[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+HIMQTTRVM_STATIC int train_incremental(himqttrvm_cache* c, himqttrvm_param* p, double* phi, size_t* index, size_t count)
+{
+    update_cache(c, p, phi, index, count);
+
+    int status = main_training_loop(c, p);
+    if (HIMQTTRVM_SUCCESS != status) {
+        return status;
+    }
+
+    c->bias_used = contains_bias(c->v_index, c->n);
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_STATIC void move_bias(himqttrvm_cache* c)
+{
+    size_t index_tail = c->n - 1;
+
+    for (size_t i = 0; i < index_tail; i++) {
+        /* ----------------^^^^^^^^^^ */
+        /* No need for execution when bias is already at the tail. */
+        if (HIMQTTRVM_BIAS_MAGIC == c->v_index[i]) {
+            c->v_index[i] = c->v_index[index_tail];
+            c->v_index[index_tail] = HIMQTTRVM_BIAS_MAGIC;
+
+            double mu_bias = c->v_mu[i];
+            c->v_mu[i] = c->v_mu[index_tail];
+            c->v_mu[index_tail] = mu_bias;
+
+            memcpy(&c->m_phi[i * c->m], &c->m_phi[index_tail * c->m], c->m * sizeof(double));
+            add_bias(c);
+
+            break;
+        }
+    }
+}
+
+HIMQTTRVM_API int himqttrvm_train(himqttrvm_cache* cache, himqttrvm_param* param1, himqttrvm_param* param2, double* phi, size_t* index, size_t count, size_t batch_size_max)
+{
+    int status = HIMQTTRVM_SUCCESS;
+
+    if ((NULL == cache) || (HIMQTTRVM_STRUCT_MAGIC != cache->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if ((NULL == param1) || (HIMQTTRVM_STRUCT_MAGIC != param1->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if ((NULL == param2) || (HIMQTTRVM_STRUCT_MAGIC != param2->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    if ((NULL == phi) || (false == is_finite(phi, cache->m * count))) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P4;
+    }
+
+    if ((NULL == index) || contains_bias(index, count)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P5;
+    }
+
+    if ((1 > count) || (count > HIMQTTRVM_MAT_DIM_MAX - cache->n - 1)) {
+        /* Reserved for bias ----------------------------------- ^ */
+        assert(false);
+        return HIMQTTRVM_INVALID_P6;
+    }
+
+    if (1 > batch_size_max) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P7;
+    }
+
+    /* batch_size_max = min(num_basis, batch_size_max) */
+    batch_size_max = batch_size_max < count ? batch_size_max : count;
+
+    /* incremental training param: param1 */
+    size_t i = 0;
+    for (i = 0; i < (count / batch_size_max); i++) {
+        double* batch_phi = &phi[i * batch_size_max * cache->m];
+        size_t* batch_index = &index[i * batch_size_max];
+
+        status = train_incremental(cache, param1, batch_phi, batch_index, batch_size_max);
+
+        if (HIMQTTRVM_SUCCESS != status) {
+            return status;
+        }
+    }
+
+    /* final polish param: param2 */
+    size_t basis_funcs_left = count % batch_size_max;
+    double* batch_phi = &phi[i * batch_size_max * cache->m];
+    size_t* batch_index = &index[i * batch_size_max];
+    status = train_incremental(cache, param2, batch_phi, batch_index, basis_funcs_left);
+
+    if (HIMQTTRVM_SUCCESS != status) {
+        return status;
+    }
+
+    /* move bias related data to the end of list */
+    if (true == cache->bias_used) {
+        move_bias(cache);
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+/******************************************************************************
+* Training results related functions
+******************************************************************************/
+
+HIMQTTRVM_API int himqttrvm_get_training_stats(himqttrvm_cache* cache, size_t* basis_count, bool* bias_used)
+{
+    if ((NULL == cache) || (HIMQTTRVM_STRUCT_MAGIC != cache->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if (NULL == basis_count) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if (NULL == bias_used) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    (*basis_count) = cache->n;
+    (*bias_used) = cache->bias_used;
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+HIMQTTRVM_API int himqttrvm_get_training_results(himqttrvm_cache* cache, size_t* index, double* mu)
+{
+    if ((NULL == cache) || (HIMQTTRVM_STRUCT_MAGIC != cache->struct_initialized)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if (NULL == index) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if (NULL == mu) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    memcpy(index, cache->v_index, cache->n * sizeof(size_t));
+    memcpy(mu, cache->v_mu, cache->n * sizeof(double));
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+/******************************************************************************
+* Prediction related functions
+******************************************************************************/
+
+HIMQTTRVM_API int himqttrvm_predict(double* phi, double* mu, size_t sample_count, size_t basis_count, double* y)
+{
+    if ((NULL == phi) || (false == is_finite(phi, sample_count * basis_count))) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if ((NULL == mu) || (false == is_finite(mu, basis_count))) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if ((1 > sample_count) || (HIMQTTRVM_MAT_DIM_MAX < sample_count)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    if ((1 > basis_count) || (HIMQTTRVM_MAT_DIM_MAX < basis_count)) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P4;
+    }
+
+    if (NULL == y) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P5;
+    }
+
+    if (1 == sample_count) {
+        (*y) = cblas_ddot(basis_count, phi, 1, mu, 1);
+    } else {
+        cblas_dgemv(CblasColMajor, CblasNoTrans, sample_count, basis_count, 1.0, phi, sample_count, mu, 1, 0.0, y, 1);
+    }
+
+    if (false == is_finite(y, sample_count)) {
+        assert(false);
+        return HIMQTTRVM_MATH_ERROR;
+    }
+
+    return HIMQTTRVM_SUCCESS;
+}
+
+/******************************************************************************
+* Miscellaneous functions
+******************************************************************************/
+
+HIMQTTRVM_API int himqttrvm_get_version(int* major, int* minor, int* patch)
+{
+    if (NULL == major) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P1;
+    }
+
+    if (NULL == minor) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P2;
+    }
+
+    if (NULL == patch) {
+        assert(false);
+        return HIMQTTRVM_INVALID_P3;
+    }
+
+    (*major) = HIMQTTRVM_VERSION_MAJOR;
+    (*minor) = HIMQTTRVM_VERSION_MINOR;
+    (*patch) = HIMQTTRVM_VERSION_PATCH;
+
+    return HIMQTTRVM_SUCCESS;
+}
